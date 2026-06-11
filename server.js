@@ -51,11 +51,26 @@ app.use((err, req, res, next) => {
   res.status(500).json({ success: false, message: err.message || 'Internal Server Error' });
 });
 
+import AutomationJob from './models/AutomationJob.js';
+import LoginEmail from './models/LoginEmail.js';
+
 // Database Connection and Server Start
 mongoose
   .connect(MONGODB_URI)
-  .then(() => {
+  .then(async () => {
     console.log('Successfully connected to MongoDB Database');
+    // Reset stuck 'running' jobs on server start
+    const fixedJobs = await AutomationJob.updateMany(
+      { status: 'running' },
+      { status: 'stopped', reason: 'Server restarted - automation was interrupted.' }
+    );
+    if (fixedJobs.modifiedCount > 0) console.log(`Reset ${fixedJobs.modifiedCount} stuck running job(s) to stopped.`);
+    // Reset stuck 'inprogress' emails back to 'pending'
+    const fixedEmails = await LoginEmail.updateMany(
+      { status: 'inprogress' },
+      { status: 'pending', reason: 'Server restarted - queued again.' }
+    );
+    if (fixedEmails.modifiedCount > 0) console.log(`Reset ${fixedEmails.modifiedCount} stuck inprogress email(s) to pending.`);
     server.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
     });

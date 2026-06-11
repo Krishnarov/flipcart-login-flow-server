@@ -19,6 +19,10 @@ const automationJobSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  completedAt: {
+    type: Date,
+    default: null
+  },
   isDeleted: {
     type: Boolean,
     default: false

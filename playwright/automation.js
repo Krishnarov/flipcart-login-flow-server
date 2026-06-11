@@ -1,49 +1,39 @@
-import { chromium } from 'playwright';
-import fs from 'fs';
-import AutomationJob from '../models/AutomationJob.js';
-import LoginEmail from '../models/LoginEmail.js';
-import { loginToFlipkart, loginToFlipkartWithOTP } from './flipkart.js';
-import { loginToEmail } from './kukuEmail.js';
-import { delay } from './utils.js';
+import { chromium } from "playwright";
+import fs from "fs";
+import AutomationJob from "../models/AutomationJob.js";
+import LoginEmail from "../models/LoginEmail.js";
+import { loginToFlipkart, loginToFlipkartWithOTP } from "./flipkart.js";
+import { loginToEmail } from "./kukuEmail.js";
+import { delay } from "./utils.js";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration
-// ─────────────────────────────────────────────────────────────────────────────
-const CONCURRENCY = 3; // How many emails to process in parallel
+const CONCURRENCY = 3;
 
 const BROWSER_ARGS = [
-  '--no-sandbox',
-  '--disable-setuid-sandbox',
-  '--disable-web-security',
-  '--disable-features=IsolateOrigins,site-per-process',
-  '--disable-blink-features=AutomationControlled',
-  '--disable-geolocation',
-  '--disable-notifications',
-  '--disable-dev-shm-usage',  // Prevents crashes in low-memory environments
-  '--disable-gpu',
-  '--no-first-run',
-  '--no-zygote',
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-web-security",
+  "--disable-features=IsolateOrigins,site-per-process",
+  "--disable-blink-features=AutomationControlled",
+  "--disable-geolocation",
+  "--disable-notifications",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--no-first-run",
+  "--no-zygote",
 ];
 
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Safely saves a Mongoose document — retries with a fresh document on VersionError */
 const safeSaveRecord = async (record) => {
   try {
     await record.save();
   } catch (err) {
-    if (err.name === 'VersionError') {
-      console.warn(`⚠️ [Automation] VersionError for ${record.email || record._id}. Retrying with fresh document...`);
+    if (err.name === "VersionError") {
       const freshRecord = await record.constructor.findById(record._id);
       if (freshRecord) {
         const modifiedPaths = record.modifiedPaths();
-        for (const path of modifiedPaths) {
-          freshRecord[path] = record[path];
-        }
+        for (const path of modifiedPaths) freshRecord[path] = record[path];
         await freshRecord.save();
       }
     } else {
@@ -52,84 +42,134 @@ const safeSaveRecord = async (record) => {
   }
 };
 
-/** Ensures screenshots directory exists */
 const ensureScreenshotsDir = () => {
-  if (!fs.existsSync('screenshots')) {
-    fs.mkdirSync('screenshots', { recursive: true });
-  }
+  if (!fs.existsSync("screenshots"))
+    fs.mkdirSync("screenshots", { recursive: true });
 };
 
-/**
- * Processes a single email record — launches its own Flipkart browser,
- * reuses the shared email context for OTP extraction.
- */
 const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
   let flipkartBrowser = null;
   let flipkartContext = null;
   let emailPage = null;
 
-  try {
-    // Mark as running
-    record.reason = 'Automation is running...';
-    await safeSaveRecord(record);
+  const emitLog = (message, type = "info") => {
+    if (io)
+      io.emit("automation-log", {
+        jobId,
+        email: record.email,
+        message,
+        type,
+        time: new Date().toISOString(),
+      });
+  };
 
-    // Launch dedicated Flipkart incognito browser for this email
+  try {
+    record.status = "inprogress";
+    record.reason = "Automation is running...";
+    await safeSaveRecord(record);
+    if (io) io.emit("job-update", { type: "email-update", jobId });
+
+    emitLog("Starting automation task...", "info");
+    emitLog("Launching Flipkart browser...", "step");
+
     flipkartBrowser = await chromium.launch({
       headless: runHeadless,
       args: BROWSER_ARGS,
-      ignoreDefaultArgs: ['--enable-automation']
+      ignoreDefaultArgs: ["--enable-automation"],
     });
     flipkartContext = await flipkartBrowser.newContext({
       viewport: { width: 1366, height: 768 },
-      userAgent: USER_AGENT
+      userAgent: USER_AGENT,
     });
     const flipkartPage = await flipkartContext.newPage();
-
-    // Open a fresh page from the shared email context
     emailPage = await emailContext.newPage();
 
-    // Step 1: Flipkart login — fills email and clicks Request OTP
-    // (loginToFlipkart now waits for OTP fields before returning)
+    emitLog("Opening Flipkart login page...", "step");
     await loginToFlipkart(flipkartPage, record.email);
+    emitLog("Email filled — OTP page loaded ✓", "success");
 
-    // Step 2: Get OTP from kuku.lu (smart polling)
+    emitLog("Opening Kuku.lu inbox to fetch OTP...", "step");
     const otp = await loginToEmail(emailPage, record.email);
+    emitLog(`OTP fetched: ${otp}`, "success");
 
-    // Step 3: Submit OTP on Flipkart
+    emitLog("Submitting OTP on Flipkart...", "step");
     await loginToFlipkartWithOTP(flipkartPage, otp);
 
-    // ── Wait for login redirect to fully complete ────────────────────────
-    // Flipkart redirects away from /account/login after OTP success
-    console.log(`[Automation] Waiting for post-login redirect: ${record.email}`);
+    emitLog("Waiting for Flipkart login redirect...", "step");
+    let loginSuccessful = false;
     try {
       await flipkartPage.waitForURL(
-        url => !url.includes('/account/login'),
-        { timeout: 20000 }
+        (url) => {
+          try {
+            const parsed = new URL(url);
+            return (
+              (parsed.hostname === "www.flipkart.com" ||
+                parsed.hostname === "flipkart.com" ||
+                parsed.hostname.endsWith(".flipkart.com")) &&
+              parsed.pathname === "/"
+            );
+          } catch (_) {
+            return false;
+          }
+        },
+        { timeout: 25000 },
       );
-      console.log(`[Automation] Redirected to: ${flipkartPage.url()}`);
-    } catch (_) {
-      console.warn(`[Automation] Redirect timeout — current URL: ${flipkartPage.url()}`);
+      loginSuccessful = true;
+      emitLog("Redirected to Flipkart home — Login successful!", "success");
+    } catch (err) {
+      emitLog(`Redirect timed out — URL: ${flipkartPage.url()}`, "warn");
     }
 
-    // Wait for page to fully settle and cookies to be written by Flipkart
-    await flipkartPage.waitForLoadState('domcontentloaded').catch(() => {});
+    if (!loginSuccessful) {
+      const errorLocators = [
+        flipkartPage.getByText(/incorrect/i),
+        flipkartPage.getByText(/valid otp/i),
+        flipkartPage.getByText(/verification unsuccessful/i),
+        flipkartPage.getByText(/wrong/i),
+      ];
+
+      let detectedError = null;
+      for (const locator of errorLocators) {
+        try {
+          if ((await locator.count()) > 0 && (await locator.isVisible())) {
+            const text = await locator.innerText().catch(() => "");
+            if (text) {
+              detectedError = text.trim();
+              break;
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (detectedError) {
+        throw new Error(`Flipkart OTP Verification Failed: ${detectedError}`);
+      } else {
+        throw new Error(
+          `Flipkart Login Failed: Did not redirect to home page. Current URL: ${flipkartPage.url()}`,
+        );
+      }
+    }
+
+    await flipkartPage.waitForLoadState("domcontentloaded").catch(() => {});
     await delay(2500);
 
-    // Check for verification failure
-    const verificationFailed = flipkartPage.getByText(/Verification unsuccessful/i);
-    if (await verificationFailed.count() > 0) {
-      throw new Error('Flipkart flagged the attempt as verification unsuccessful.');
+    const verificationFailed = flipkartPage.getByText(
+      /Verification unsuccessful/i,
+    );
+    if ((await verificationFailed.count()) > 0) {
+      throw new Error(
+        "Flipkart flagged the attempt as verification unsuccessful.",
+      );
     }
 
-    // ── Extract ALL session data BEFORE closing browser ──────────────────
-    console.log(`[Automation] Extracting session data: ${record.email}`);
+    emitLog("Extracting cookies & session data...", "step");
 
     let cookies = [];
     try {
       cookies = await flipkartContext.cookies();
-      console.log(`[Automation] ✔ ${cookies.length} cookies extracted for: ${record.email}`);
+      emitLog(`${cookies.length} cookies extracted`, "info");
     } catch (cookieErr) {
-      console.warn(`[Automation] Could not extract cookies: ${cookieErr.message}`);
+      emitLog(`Could not extract cookies: ${cookieErr.message}`, "warn");
     }
 
     let localStorageData = {};
@@ -142,10 +182,7 @@ const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
         }
         return d;
       });
-      console.log(`[Automation] ✔ ${Object.keys(localStorageData).length} localStorage keys for: ${record.email}`);
-    } catch (lsErr) {
-      console.warn(`[Automation] Could not extract localStorage: ${lsErr.message}`);
-    }
+    } catch (lsErr) {}
 
     let sessionStorageData = {};
     try {
@@ -157,38 +194,32 @@ const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
         }
         return d;
       });
-      console.log(`[Automation] ✔ ${Object.keys(sessionStorageData).length} sessionStorage keys for: ${record.email}`);
-    } catch (ssErr) {
-      console.warn(`[Automation] Could not extract sessionStorage: ${ssErr.message}`);
-    }
+    } catch (ssErr) {}
 
-    // ── Take success screenshot ──────────────────────────────────────────
+    emitLog("Taking success screenshot...", "step");
     ensureScreenshotsDir();
     const screenshotPath = `screenshots/success-${record.email}-${Date.now()}.png`;
     await flipkartPage.screenshot({ path: screenshotPath, fullPage: false });
 
-    // ── Save to MongoDB (markModified is REQUIRED for Array/Mixed fields) ─
-    record.status = 'success';
+    emitLog("Saving session to database...", "step");
+    record.status = "success";
     record.reason = `Login successful. Cookies: ${cookies.length} | LS keys: ${Object.keys(localStorageData).length}`;
     record.screenshot = screenshotPath;
     record.cookies = cookies;
     record.localStorage = localStorageData;
     record.sessionStorage = sessionStorageData;
-
-    // CRITICAL: Without markModified(), Mongoose skips saving Array/Mixed fields
-    record.markModified('cookies');
-    record.markModified('localStorage');
-    record.markModified('sessionStorage');
-
+    record.completedAt = new Date();
+    record.markModified("cookies");
+    record.markModified("localStorage");
+    record.markModified("sessionStorage");
     await safeSaveRecord(record);
-    if (io) io.emit('job-update', { type: 'email-update', jobId });
-    console.log(`✅ [Automation] DB saved — ${record.email} | Cookies: ${cookies.length}`);
 
+    emitLog("✅ Completed successfully!", "success");
+    if (io) io.emit("job-update", { type: "email-update", jobId });
   } catch (error) {
-    console.error(`❌ [Automation] Error: ${record.email} — ${error.message}`);
+    emitLog(`❌ Failed: ${error.message}`, "error");
 
-    // Attempt error screenshot
-    let screenshotPath = '';
+    let screenshotPath = "";
     try {
       if (flipkartContext) {
         const pages = flipkartContext.pages();
@@ -200,134 +231,168 @@ const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
       }
     } catch (_) {}
 
-    record.status = 'failed';
+    record.status = "failed";
     record.reason = error.message;
+    record.completedAt = new Date();
     if (screenshotPath) record.screenshot = screenshotPath;
-    record.markModified('cookies');
-    record.markModified('localStorage');
-    record.markModified('sessionStorage');
+    record.markModified("cookies");
+    record.markModified("localStorage");
+    record.markModified("sessionStorage");
     await safeSaveRecord(record);
-    if (io) io.emit('job-update', { type: 'email-update', jobId });
 
+    emitLog("Marked as failed in database.", "error");
+    if (io) io.emit("job-update", { type: "email-update", jobId });
   } finally {
-    // ── Close browsers ONLY AFTER data is fully saved ────────────────────
-    try { if (emailPage) await emailPage.close(); } catch (_) {}
-    try { if (flipkartBrowser) await flipkartBrowser.close(); } catch (_) {}
-    console.log(`[Automation] 🔒 Browser closed for: ${record.email}`);
+    try {
+      if (emailPage) await emailPage.close();
+    } catch (_) {}
+    try {
+      if (flipkartBrowser) await flipkartBrowser.close();
+    } catch (_) {}
+    emitLog("Browser closed.", "info");
     flipkartBrowser = null;
     flipkartContext = null;
     emailPage = null;
   }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main Automation Entry Point
-// ─────────────────────────────────────────────────────────────────────────────
+export const runFlipkartAutomation = async (
+  jobId,
+  userId,
+  runHeadless = true,
+  io = null,
+) => {
+  const emitJobLog = (message, type = "info") => {
+    if (io)
+      io.emit("automation-log", {
+        jobId,
+        email: null,
+        message,
+        type,
+        time: new Date().toISOString(),
+      });
+  };
 
-/**
- * Runs Flipkart Login automation for all pending emails in a Job.
- * Processes emails in parallel batches of CONCURRENCY size.
- *
- * @param {string} jobId   - AutomationJob _id
- * @param {string} userId  - User _id (for ownership checks)
- * @param {boolean} runHeadless - Whether to run browsers headlessly
- */
-export const runFlipkartAutomation = async (jobId, userId, runHeadless = true, io = null) => {
-  console.log(`🟢 [Automation] Starting Job "${jobId}" | Headless: ${runHeadless} | Concurrency: ${CONCURRENCY}`);
+  emitJobLog(
+    `🟢 Starting Job — Headless: ${runHeadless} | Concurrency: ${CONCURRENCY}`,
+    "info",
+  );
 
-  // Fetch all pending emails for this job
-  const emails = await LoginEmail.find({ jobId, status: 'pending' });
-  console.log(`[Automation] Found ${emails.length} pending email(s) to process.`);
+  const emails = await LoginEmail.find({ jobId, status: "pending" }).sort({
+    email: 1,
+  });
+  emitJobLog(`Found ${emails.length} pending email(s) to process.`, "info");
 
   if (emails.length === 0) {
-    await AutomationJob.updateOne({ _id: jobId, userId }, {
-      status: 'completed',
-      reason: 'All automation tasks completed successfully.'
-    });
-    if (io) io.emit('job-update', { type: 'status-change', jobId });
-    console.log(`🏁 [Automation] Job "${jobId}" fully completed.`);
+    await AutomationJob.updateOne(
+      { _id: jobId, userId },
+      {
+        status: "completed",
+        reason: "All automation tasks completed successfully.",
+      },
+    );
+    if (io) io.emit("job-update", { type: "status-change", jobId });
+    emitJobLog("🏁 Job fully completed.", "success");
     return;
   }
 
-  // Set job to 'running'
-  await AutomationJob.updateOne({ _id: jobId, userId }, {
-    status: 'running',
-    reason: `Processing ${emails.length} email(s) with ${CONCURRENCY} parallel workers...`
-  });
+  await AutomationJob.updateOne(
+    { _id: jobId, userId },
+    {
+      status: "running",
+      reason: `Processing ${emails.length} email(s) with ${CONCURRENCY} parallel workers...`,
+    },
+  );
+  if (io) io.emit("job-update", { type: "status-change", jobId });
 
-  // Launch ONE shared email context (kuku.lu session) for the whole job
-  // Each worker opens/closes its own page inside this context
-  const emailArgs = BROWSER_ARGS.filter(a => a !== '--incognito');
+  const emailArgs = BROWSER_ARGS.filter((a) => a !== "--incognito");
   let emailContext = null;
   try {
-    emailContext = await chromium.launchPersistentContext('./kuku-session', {
+    emitJobLog("Launching shared Kuku.lu email context...", "step");
+    emailContext = await chromium.launchPersistentContext("./kuku-session", {
       headless: runHeadless,
       args: emailArgs,
       viewport: { width: 1366, height: 768 },
-      userAgent: USER_AGENT
+      userAgent: USER_AGENT,
     });
-    console.log('[Automation] Shared kuku.lu email context launched.');
+    emitJobLog("Kuku.lu context ready.", "info");
   } catch (ctxErr) {
-    console.error('[Automation] Failed to launch email context:', ctxErr.message);
-    await AutomationJob.updateOne({ _id: jobId, userId }, {
-      status: 'failed',
-      reason: `Failed to launch email browser: ${ctxErr.message}`
-    });
+    emitJobLog(`Failed to launch email browser: ${ctxErr.message}`, "error");
+    await AutomationJob.updateOne(
+      { _id: jobId, userId },
+      {
+        status: "failed",
+        reason: `Failed to launch email browser: ${ctxErr.message}`,
+      },
+    );
+    if (io) io.emit("job-update", { type: "status-change", jobId });
     return;
   }
 
-  // ── Process emails in parallel batches ──────────────────────────────────
   for (let i = 0; i < emails.length; i += CONCURRENCY) {
-    // Check if user stopped the job
     const checkJob = await AutomationJob.findById(jobId);
-    if (!checkJob || checkJob.status === 'stopped') {
-      console.log(`🛑 [Automation] Stop signal detected. Halting.`);
+    if (!checkJob || checkJob.status === "stopped") {
+      emitJobLog("🛑 Stop signal detected. Halting.", "warn");
       break;
     }
 
     const batch = emails.slice(i, i + CONCURRENCY);
-    console.log(`[Automation] Processing batch ${Math.floor(i/CONCURRENCY) + 1}...`);
-
-    const promises = batch.map(emailRecord => 
-      processEmail(emailRecord, emailContext, jobId, runHeadless, io)
+    emitJobLog(
+      `Processing batch ${Math.floor(i / CONCURRENCY) + 1} of ${Math.ceil(emails.length / CONCURRENCY)} (${batch.length} emails)...`,
+      "info",
     );
-    
-    await Promise.all(promises);
-    
-    // Update job progress after each batch
-    if (io) io.emit('job-update', { type: 'batch-complete', jobId });
+
+    await Promise.all(
+      batch.map((emailRecord) =>
+        processEmail(emailRecord, emailContext, jobId, runHeadless, io),
+      ),
+    );
+
+    if (io) io.emit("job-update", { type: "batch-complete", jobId });
   }
 
-  // ── Close shared email context ───────────────────────────────────────────
   try {
     await emailContext.close();
-    console.log('[Automation] Shared email context closed.');
   } catch (_) {}
 
-  // ── Finalize job status ──────────────────────────────────────────────────
   const finalJob = await AutomationJob.findById(jobId);
-  if (finalJob && finalJob.status !== 'stopped') {
-    const pendingCount = await LoginEmail.countDocuments({ jobId, status: 'pending' });
-    const failedCount  = await LoginEmail.countDocuments({ jobId, status: 'failed' });
-    const successCount = await LoginEmail.countDocuments({ jobId, status: 'success' });
+  if (finalJob && finalJob.status !== "stopped") {
+    const pendingCount = await LoginEmail.countDocuments({
+      jobId,
+      status: "pending",
+    });
+    const failedCount = await LoginEmail.countDocuments({
+      jobId,
+      status: "failed",
+    });
+    const successCount = await LoginEmail.countDocuments({
+      jobId,
+      status: "success",
+    });
 
     if (pendingCount === 0) {
       if (failedCount > 0 && successCount === 0) {
-        finalJob.status = 'failed';
+        finalJob.status = "failed";
         finalJob.reason = `All ${failedCount} login attempt(s) failed.`;
+        finalJob.completedAt = new Date();
       } else if (failedCount > 0) {
-        finalJob.status = 'completed';
+        finalJob.status = "completed";
         finalJob.reason = `Completed with ${successCount} success, ${failedCount} failed.`;
+        finalJob.completedAt = new Date();
       } else {
-        finalJob.status = 'completed';
+        finalJob.status = "completed";
         finalJob.reason = `All ${successCount} Flipkart login(s) executed successfully! 🎉`;
+        finalJob.completedAt = new Date();
       }
     } else {
-      finalJob.status = 'stopped';
-      finalJob.reason = 'Execution stopped before all emails were processed.';
+      finalJob.status = "stopped";
+      finalJob.reason = "Execution stopped before all emails were processed.";
     }
     await safeSaveRecord(finalJob);
+    emitJobLog(
+      `🏁 Job finished — ${finalJob.status.toUpperCase()}: ${finalJob.reason}`,
+      finalJob.status === "completed" ? "success" : "warn",
+    );
+    if (io) io.emit("job-update", { type: "status-change", jobId });
   }
-
-  console.log(`🏁 [Automation] Job "${jobId}" finished.`);
 };

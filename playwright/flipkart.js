@@ -60,13 +60,28 @@ export const loginToFlipkartWithOTP = async (page, otp) => {
     }
     console.log('[Flipkart] OTP fields filled.');
 
-    // Wait briefly for form auto-submit or click verify if needed
-    await delay(300);
+    // Wait briefly to see if it auto-submits
+    await delay(500);
+
+    // If we have already redirected away from login, skip clicking Verify
+    if (!page.url().includes('/account/login')) {
+      console.log('[Flipkart] Already redirected away from login page. Skipping Verify button click.');
+      return;
+    }
 
     // Some Flipkart versions auto-submit, others need a button click
     const verifyBtn = page.getByRole('button', { name: /verify/i });
-    if (await verifyBtn.count() > 0) {
-      await verifyBtn.click().catch(() => {});
+    try {
+      if (await verifyBtn.count() > 0 && await verifyBtn.isVisible()) {
+        console.log('[Flipkart] Clicking Verify button...');
+        await verifyBtn.click({ timeout: 5000 }).catch((clickErr) => {
+          console.log(`[Flipkart] Verify button click failed/ignored (might be navigating): ${clickErr.message}`);
+        });
+      } else {
+        console.log('[Flipkart] Verify button not found or not visible (might have auto-submitted).');
+      }
+    } catch (btnErr) {
+      console.log(`[Flipkart] Verify button check skipped: ${btnErr.message}`);
     }
 
   } catch (error) {

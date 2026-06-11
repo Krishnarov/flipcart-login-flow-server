@@ -1,9 +1,16 @@
 import express from 'express';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { requireAuth } from '../middleware/auth.js';
 import AutomationJob from '../models/AutomationJob.js';
 import LoginEmail from '../models/LoginEmail.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SCREENSHOTS_DIR = path.join(__dirname, '../../screenshots');
 
 const router = express.Router();
 
@@ -39,12 +46,21 @@ const findEmailValue = (row) => {
   return null;
 };
 
+const findSlotValue = (row) => {
+  const slotKeys = ['slot', 'slot name', 'slotname', 'slot_name'];
+  for (const key of Object.keys(row)) {
+    if (slotKeys.includes(key.toLowerCase().trim())) {
+      return row[key] ? row[key].toString().trim() : '';
+    }
+  }
+  return '';
+};
+
 // --- Helper for Pagination, Search, and Date Filtering ---
 const buildMatchQuery = (req, baseQuery = {}) => {
   const { search, startDate, endDate } = req.query;
   const match = { ...baseQuery };
 
-  // Search by uploadedFile (jobs) or email/reason (details)
   if (search) {
     match.$or = [
       { uploadedFile: { $regex: search, $options: 'i' } },
@@ -54,7 +70,6 @@ const buildMatchQuery = (req, baseQuery = {}) => {
     ];
   }
 
-  // Date Filtering
   if (startDate || endDate) {
     match.createdAt = {};
     if (startDate) match.createdAt.$gte = new Date(startDate);
@@ -76,16 +91,27 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
 
     if (jsonData.length === 0) return res.status(400).json({ success: false, message: 'The Excel sheet is empty' });
 
-    const parsedEmails = [];
+    // Parse rows, remove duplicates, collect slot
+    const parsedRows = [];
+    const seenEmails = new Set();
     for (let i = 0; i < jsonData.length; i++) {
       const row = jsonData[i];
       const email = findEmailValue(row);
-      if (email) parsedEmails.push(email.toString().toLowerCase().trim());
+      if (email) {
+        const normalizedEmail = email.toString().toLowerCase().trim();
+        if (!seenEmails.has(normalizedEmail)) {
+          seenEmails.add(normalizedEmail);
+          parsedRows.push({ email: normalizedEmail, slot: findSlotValue(row) });
+        }
+      }
     }
 
-    if (parsedEmails.length === 0) {
+    if (parsedRows.length === 0) {
       return res.status(400).json({ success: false, message: 'No email addresses could be detected.' });
     }
+
+    // Sort alphabetically A to Z
+    parsedRows.sort((a, b) => a.email.localeCompare(b.email));
 
     const job = new AutomationJob({
       userId: req.user._id,
@@ -95,10 +121,10 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     });
     await job.save();
 
-    const bulkOps = parsedEmails.map(email => ({
+    const bulkOps = parsedRows.map(({ email, slot }) => ({
       updateOne: {
         filter: { email },
-        update: { $set: { jobId: job._id, status: 'pending', reason: '', screenshot: '', cookies: [], localStorage: {}, sessionStorage: {} } },
+        update: { $set: { jobId: job._id, status: 'pending', slot, reason: '', screenshot: '', cookies: [], localStorage: {}, sessionStorage: {} } },
         upsert: true
       }
     }));
@@ -119,31 +145,31 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
 });
 
 // @route   GET api/emails/stats
-// @desc    Get unpaginated global stats
 router.get('/stats', requireAuth, async (req, res) => {
   try {
     const jobsCount = await AutomationJob.countDocuments({ userId: req.user._id, isDeleted: false });
     const activeJobs = await AutomationJob.find({ userId: req.user._id, isDeleted: false }, '_id status');
-    
+
     let runningCount = 0;
     const jobIds = activeJobs.map(j => {
-      if (j.status === 'running' || j.status === 'pending') runningCount++;
+      if (j.status === 'running') runningCount++;
       return j._id;
     });
-    
+
     const emailStats = await LoginEmail.aggregate([
       { $match: { jobId: { $in: jobIds } } },
       { $group: {
         _id: null,
         total: { $sum: 1 },
-        success: { $sum: { $cond: [{ $eq: ["$status", "success"] }, 1, 0] } },
-        failed: { $sum: { $cond: [{ $eq: ["$status", "failed"] }, 1, 0] } },
-        pending: { $sum: { $cond: [{ $eq: ["$status", "pending"] }, 1, 0] } }
+        success: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+        failed: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+        pending: { $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] } },
+        inprogress: { $sum: { $cond: [{ $eq: ['$status', 'inprogress'] }, 1, 0] } }
       }}
     ]);
 
-    const stats = emailStats.length > 0 ? emailStats[0] : { total: 0, success: 0, failed: 0, pending: 0 };
-    
+    const stats = emailStats.length > 0 ? emailStats[0] : { total: 0, success: 0, failed: 0, pending: 0, inprogress: 0 };
+
     return res.status(200).json({
       success: true,
       stats: {
@@ -152,7 +178,8 @@ router.get('/stats', requireAuth, async (req, res) => {
         total: stats.total,
         success: stats.success,
         failed: stats.failed,
-        pending: stats.pending
+        pending: stats.pending,
+        inprogress: stats.inprogress
       }
     });
   } catch (err) {
@@ -161,7 +188,6 @@ router.get('/stats', requireAuth, async (req, res) => {
 });
 
 // @route   GET api/emails/files
-// @desc    Get server-side paginated automation jobs
 router.get('/files', requireAuth, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -171,7 +197,6 @@ router.get('/files', requireAuth, async (req, res) => {
     const sortOrder = req.query.sortOrder === 'asc' ? 1 : -1;
 
     const matchQuery = buildMatchQuery(req, { userId: req.user._id, isDeleted: false });
-    // Remove unsupported fields for jobs
     delete matchQuery.$or;
     if (req.query.search) {
       matchQuery.$or = [
@@ -187,21 +212,15 @@ router.get('/files', requireAuth, async (req, res) => {
       { $sort: { [sortField]: sortOrder } },
       { $skip: skip },
       { $limit: limit },
-      {
-        $lookup: {
-          from: 'loginemails',
-          localField: '_id',
-          foreignField: 'jobId',
-          as: 'emails'
-        }
-      },
+      { $lookup: { from: 'loginemails', localField: '_id', foreignField: 'jobId', as: 'emails' } },
       {
         $project: {
           _id: 1, uploadedFile: 1, status: 1, reason: 1, createdAt: 1,
-          totalEmails: { $size: "$emails" },
-          successCount: { $size: { $filter: { input: "$emails", as: "e", cond: { $eq: ["$$e.status", "success"] } } } },
-          failedCount: { $size: { $filter: { input: "$emails", as: "e", cond: { $eq: ["$$e.status", "failed"] } } } },
-          pendingCount: { $size: { $filter: { input: "$emails", as: "e", cond: { $eq: ["$$e.status", "pending"] } } } }
+          totalEmails: { $size: '$emails' },
+          successCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'success'] } } } },
+          failedCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'failed'] } } } },
+          pendingCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'pending'] } } } },
+          inprogressCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'inprogress'] } } } }
         }
       }
     ]);
@@ -239,11 +258,10 @@ router.get('/file-details', requireAuth, async (req, res) => {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 50;
     const skip = (page - 1) * limit;
-    const sortField = req.query.sortField || 'createdAt';
+    const sortField = req.query.sortField || 'email';
     const sortOrder = req.query.sortOrder === 'desc' ? -1 : 1;
 
     const matchQuery = buildMatchQuery(req, { jobId: job._id });
-    // Remove unsupported fields for emails
     delete matchQuery.$or;
     if (req.query.search) {
       matchQuery.$or = [
@@ -256,12 +274,12 @@ router.get('/file-details', requireAuth, async (req, res) => {
     const totalRecords = await LoginEmail.countDocuments(matchQuery);
     const emails = await LoginEmail.find(matchQuery).sort({ [sortField]: sortOrder }).skip(skip).limit(limit);
 
-    // Global counts for this job ignoring pagination
     const allEmails = await LoginEmail.find({ jobId: job._id }, 'status');
     const total = allEmails.length;
     const success = allEmails.filter(e => e.status === 'success').length;
     const failed = allEmails.filter(e => e.status === 'failed').length;
     const pending = allEmails.filter(e => e.status === 'pending').length;
+    const inprogress = allEmails.filter(e => e.status === 'inprogress').length;
 
     return res.status(200).json({
       success: true,
@@ -273,6 +291,7 @@ router.get('/file-details', requireAuth, async (req, res) => {
       successCount: success,
       failedCount: failed,
       pendingCount: pending,
+      inprogressCount: inprogress,
       successPercentage: total > 0 ? Math.round((success / total) * 100) : 0,
       failedPercentage: total > 0 ? Math.round((failed / total) * 100) : 0,
       data: emails,
@@ -318,12 +337,12 @@ router.get('/trash', requireAuth, async (req, res) => {
       }}
     ]);
 
-    return res.status(200).json({ 
-      success: true, 
+    return res.status(200).json({
+      success: true,
       data: trashedJobs,
       totalRecords,
       totalPages: Math.ceil(totalRecords / limit),
-      currentPage: page 
+      currentPage: page
     });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Error fetching trash' });
@@ -331,11 +350,10 @@ router.get('/trash', requireAuth, async (req, res) => {
 });
 
 // @route   GET api/emails/export
-// @desc    Export to Excel ignoring pagination but respecting filters
 router.get('/export', requireAuth, async (req, res) => {
   try {
     const { type, jobId, search, startDate, endDate } = req.query;
-    
+
     let dataToExport = [];
     let fileName = 'export.xlsx';
 
@@ -360,9 +378,9 @@ router.get('/export', requireAuth, async (req, res) => {
         { $lookup: { from: 'loginemails', localField: '_id', foreignField: 'jobId', as: 'emails' } },
         { $project: {
             uploadedFile: 1, status: 1, reason: 1, createdAt: 1, deletedAt: 1,
-            totalEmails: { $size: "$emails" },
-            successCount: { $size: { $filter: { input: "$emails", as: "e", cond: { $eq: ["$$e.status", "success"] } } } },
-            failedCount: { $size: { $filter: { input: "$emails", as: "e", cond: { $eq: ["$$e.status", "failed"] } } } }
+            totalEmails: { $size: '$emails' },
+            successCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'success'] } } } },
+            failedCount: { $size: { $filter: { input: '$emails', as: 'e', cond: { $eq: ['$$e.status', 'failed'] } } } }
         }}
       ]);
 
@@ -391,12 +409,14 @@ router.get('/export', requireAuth, async (req, res) => {
           { reason: { $regex: search, $options: 'i' } }
         ];
       }
-      const emails = await LoginEmail.find(matchQuery).sort({ createdAt: 1 });
-      
+      const emails = await LoginEmail.find(matchQuery).sort({ email: 1 });
+
       dataToExport = emails.map(e => ({
         'Email Address': e.email,
+        'Slot': e.slot || '',
         'Status': e.status,
         'Reason': e.reason || '',
+        'Completed At': e.completedAt ? new Date(e.completedAt).toLocaleString() : '',
         'Created At': new Date(e.createdAt).toLocaleString()
       }));
       fileName = `JobDetails_${job.uploadedFile}.xlsx`;
@@ -415,6 +435,98 @@ router.get('/export', requireAuth, async (req, res) => {
   }
 });
 
+// @route   GET api/emails/daily-stats
+// @desc    Get per-day success/failed/total counts for last 14 days
+router.get('/daily-stats', requireAuth, async (req, res) => {
+  try {
+    const jobs = await AutomationJob.find({ userId: req.user._id, isDeleted: false }, '_id');
+    const jobIds = jobs.map(j => j._id);
+    const since = new Date();
+    since.setDate(since.getDate() - 13);
+    since.setHours(0, 0, 0, 0);
+
+    const result = await LoginEmail.aggregate([
+      { $match: { jobId: { $in: jobIds }, createdAt: { $gte: since } } },
+      { $group: {
+        _id: { $dateToString: { format: '%d %b', date: '$createdAt' } },
+        total: { $sum: 1 },
+        success: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+        failed:  { $sum: { $cond: [{ $eq: ['$status', 'failed']  }, 1, 0] } }
+      }},
+      { $sort: { _id: 1 } }
+    ]);
+
+    return res.status(200).json({ success: true, data: result.map(r => ({ date: r._id, total: r.total, success: r.success, failed: r.failed })) });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Error fetching daily stats' });
+  }
+});
+
+// @route   GET api/emails/slots
+// @desc    Get all unique slots across user's jobs
+router.get('/slots', requireAuth, async (req, res) => {
+  try {
+    const jobs = await AutomationJob.find({ userId: req.user._id, isDeleted: false }, '_id');
+    const jobIds = jobs.map(j => j._id);
+    const slots = await LoginEmail.distinct('slot', { jobId: { $in: jobIds }, slot: { $nin: ['', null] } });
+    return res.status(200).json({ success: true, slots: slots.sort() });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Error fetching slots' });
+  }
+});
+
+// @route   GET api/emails/global-report
+// @desc    Get emails filtered by slot across all jobs
+router.get('/global-report', requireAuth, async (req, res) => {
+  try {
+    const { slot, status } = req.query;
+    const jobs = await AutomationJob.find({ userId: req.user._id, isDeleted: false }, '_id uploadedFile');
+    const jobIds = jobs.map(j => j._id);
+    const jobMap = {};
+    jobs.forEach(j => { jobMap[j._id.toString()] = j.uploadedFile; });
+
+    const query = { jobId: { $in: jobIds } };
+    if (slot && slot !== 'all') query.slot = slot;
+    if (status && status !== 'all') query.status = status;
+
+    const emails = await LoginEmail.find(query).sort({ email: 1 }).select('email slot status reason completedAt createdAt cookies localStorage sessionStorage jobId');
+
+    const data = emails.map(e => ({
+      ...e.toObject(),
+      jobName: jobMap[e.jobId.toString()] || ''
+    }));
+
+    return res.status(200).json({ success: true, data, total: data.length });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Error fetching global report' });
+  }
+});
+
+// @route   DELETE api/emails/delete-all-data
+// @desc    Delete emails filtered by slot+status (or all if none specified)
+router.delete('/delete-all-data', requireAuth, async (req, res) => {
+  try {
+    const { slot, status } = req.query;
+    const jobs = await AutomationJob.find({ userId: req.user._id }, '_id');
+    const jobIds = jobs.map(j => j._id);
+
+    const query = { jobId: { $in: jobIds } };
+    if (slot && slot !== 'all') query.slot = slot;
+    if (status && status !== 'all') query.status = status;
+
+    const result = await LoginEmail.deleteMany(query);
+
+    const label = [
+      slot && slot !== 'all' ? `slot "${slot}"` : null,
+      status && status !== 'all' ? `status "${status}"` : null
+    ].filter(Boolean).join(' + ') || 'all data';
+
+    if (req.app.locals.io) req.app.locals.io.emit('job-update', { type: 'delete-all' });
+    return res.status(200).json({ success: true, message: `Deleted ${result.deletedCount} email(s) matching ${label}.` });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: 'Error deleting data' });
+  }
+});
 // @route   POST api/emails/start-automation
 router.post('/start-automation', requireAuth, async (req, res) => {
   try {
@@ -424,11 +536,11 @@ router.post('/start-automation', requireAuth, async (req, res) => {
     const job = await AutomationJob.findOne({ _id: jobId, userId: req.user._id });
     if (!job) return res.status(404).json({ success: false, message: 'Job not found' });
 
-    if (['pending', 'running'].includes(job.status)) {
-      return res.status(400).json({ success: false, message: 'Automation is already running or queued.' });
+    if (job.status === 'running') {
+      return res.status(400).json({ success: false, message: 'Automation is already running.' });
     }
 
-    const pendingCount = await LoginEmail.countDocuments({ jobId: job._id, status: 'pending' });
+    const pendingCount = await LoginEmail.countDocuments({ jobId: job._id, status: { $in: ['pending', 'inprogress'] } });
     if (pendingCount === 0) {
       return res.status(400).json({ success: false, message: 'No pending emails to process. Use Retry.' });
     }
@@ -438,8 +550,8 @@ router.post('/start-automation', requireAuth, async (req, res) => {
     await job.save();
 
     await LoginEmail.updateMany(
-      { jobId: job._id, status: 'pending' },
-      { reason: 'Queued for automation...', screenshot: '' }
+      { jobId: job._id, status: { $in: ['pending', 'inprogress'] } },
+      { status: 'pending', reason: 'Queued for automation...', screenshot: '' }
     );
 
     if (req.app.locals.io) req.app.locals.io.emit('job-update', { type: 'status-change', jobId });
@@ -459,14 +571,14 @@ router.post('/stop-automation', requireAuth, async (req, res) => {
     const { jobId } = req.body;
     if (!jobId) return res.status(400).json({ success: false, message: 'Job ID parameter is required' });
 
-    const result = await AutomationJob.updateOne(
+    await AutomationJob.updateOne(
       { _id: jobId, userId: req.user._id },
       { status: 'stopped', reason: 'Stopped by user request.' }
     );
 
     if (req.app.locals.io) req.app.locals.io.emit('job-update', { type: 'status-change', jobId });
 
-    return res.status(200).json({ success: true, message: `Stopped automation job successfully.` });
+    return res.status(200).json({ success: true, message: 'Stopped automation job successfully.' });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Error stopping automation' });
   }
@@ -572,12 +684,23 @@ router.delete('/permanent-delete/:jobId', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'Move to trash first.' });
     }
 
-    const emailResult = await LoginEmail.deleteMany({ jobId: job._id });
+    // Delete screenshot files from disk
+    const emails = await LoginEmail.find({ jobId: job._id }, 'screenshot');
+    for (const e of emails) {
+      if (e.screenshot) {
+        const filePath = path.isAbsolute(e.screenshot)
+          ? e.screenshot
+          : path.join(SCREENSHOTS_DIR, path.basename(e.screenshot));
+        fs.unlink(filePath, () => {});
+      }
+    }
+
+    await LoginEmail.deleteMany({ jobId: job._id });
     await AutomationJob.deleteOne({ _id: job._id });
 
     if (req.app.locals.io) req.app.locals.io.emit('job-update', { type: 'permanent-delete', jobId: job._id });
 
-    return res.status(200).json({ success: true, message: `Job permanently deleted.` });
+    return res.status(200).json({ success: true, message: 'Job permanently deleted.' });
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Error permanently deleting job' });
   }

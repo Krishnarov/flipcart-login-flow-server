@@ -13,9 +13,13 @@ const loginEmailSchema = new mongoose.Schema({
     lowercase: true,
     unique: true
   },
+  slot: {
+    type: String,
+    default: ''
+  },
   status: {
     type: String,
-    enum: ['pending', 'success', 'failed'],
+    enum: ['pending', 'inprogress', 'success', 'failed'],
     default: 'pending'
   },
   screenshot: {
@@ -25,6 +29,10 @@ const loginEmailSchema = new mongoose.Schema({
   reason: {
     type: String,
     default: ''
+  },
+  completedAt: {
+    type: Date,
+    default: null
   },
   cookies: {
     type: Array,
