@@ -96,28 +96,48 @@ const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
     await loginToFlipkartWithOTP(flipkartPage, otp);
 
     emitLog("Waiting for Flipkart login redirect...", "step");
+
+    const isHomePage = (url) => {
+      try {
+        const parsed = new URL(url);
+        return (
+          (parsed.hostname === "www.flipkart.com" ||
+            parsed.hostname === "flipkart.com" ||
+            parsed.hostname.endsWith(".flipkart.com")) &&
+          !parsed.pathname.startsWith("/account")
+        );
+      } catch (_) {
+        return false;
+      }
+    };
+
     let loginSuccessful = false;
+
+    // First attempt — wait up to 40s for redirect
     try {
-      await flipkartPage.waitForURL(
-        (url) => {
-          try {
-            const parsed = new URL(url);
-            return (
-              (parsed.hostname === "www.flipkart.com" ||
-                parsed.hostname === "flipkart.com" ||
-                parsed.hostname.endsWith(".flipkart.com")) &&
-              parsed.pathname === "/"
-            );
-          } catch (_) {
-            return false;
-          }
-        },
-        { timeout: 25000 },
-      );
+      await flipkartPage.waitForURL(isHomePage, { timeout: 40000 });
       loginSuccessful = true;
       emitLog("Redirected to Flipkart home — Login successful!", "success");
-    } catch (err) {
+    } catch (_) {
       emitLog(`Redirect timed out — URL: ${flipkartPage.url()}`, "warn");
+    }
+
+    // Second check — if still on login page, wait 5 more seconds and recheck
+    if (!loginSuccessful) {
+      await delay(5000);
+      if (isHomePage(flipkartPage.url())) {
+        loginSuccessful = true;
+        emitLog("Delayed redirect detected — Login successful!", "success");
+      }
+    }
+
+    // Third check — maybe redirected to some other flipkart page (not /account/login)
+    if (!loginSuccessful) {
+      const currentUrl = flipkartPage.url();
+      if (!currentUrl.includes('/account/login') && currentUrl.includes('flipkart.com')) {
+        loginSuccessful = true;
+        emitLog(`Redirected away from login page — Login successful! URL: ${currentUrl}`, "success");
+      }
     }
 
     if (!loginSuccessful) {
