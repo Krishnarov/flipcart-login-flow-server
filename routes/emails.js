@@ -124,12 +124,12 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     const bulkOps = parsedRows.map(({ email, slot }) => ({
       updateOne: {
         filter: { email },
-        update: { $set: { jobId: job._id, status: 'pending', slot, reason: '', screenshot: '', cookies: [], localStorage: {}, sessionStorage: {} } },
+        update: { $set: { jobId: job._id, status: 'pending', slot, reason: 'Queued for automation...', screenshot: '', cookies: [], localStorage: {}, sessionStorage: {}, completedAt: null } },
         upsert: true
       }
     }));
-    const bulkResult = await LoginEmail.bulkWrite(bulkOps);
-    const savedEmails = { length: bulkResult.upsertedCount + bulkResult.modifiedCount };
+    await LoginEmail.bulkWrite(bulkOps);
+    const savedEmails = { length: parsedRows.length };
 
     if (req.app.locals.io) req.app.locals.io.emit('job-update', { type: 'new-job', jobId: job._id });
 
@@ -550,7 +550,7 @@ router.post('/start-automation', requireAuth, async (req, res) => {
     await job.save();
 
     await LoginEmail.updateMany(
-      { jobId: job._id, status: { $in: ['pending', 'inprogress'] } },
+      { jobId: job._id },
       { status: 'pending', reason: 'Queued for automation...', screenshot: '' }
     );
 

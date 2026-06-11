@@ -1,10 +1,13 @@
 import { chromium } from "playwright";
 import fs from "fs";
+import dns from "dns";
 import AutomationJob from "../models/AutomationJob.js";
 import LoginEmail from "../models/LoginEmail.js";
 import { loginToFlipkart, loginToFlipkartWithOTP } from "./flipkart.js";
 import { loginToEmail } from "./kukuEmail.js";
 import { delay } from "./utils.js";
+
+dns.setServers(['1.1.1.1', '8.8.8.8']);
 
 const CONCURRENCY = 3;
 
@@ -298,9 +301,7 @@ export const runFlipkartAutomation = async (
     "info",
   );
 
-  const emails = await LoginEmail.find({ jobId, status: "pending" }).sort({
-    email: 1,
-  });
+  const emails = await LoginEmail.find({ jobId, status: "pending" }).sort({ email: 1 }).limit(0);
   emitJobLog(`Found ${emails.length} pending email(s) to process.`, "info");
 
   if (emails.length === 0) {
