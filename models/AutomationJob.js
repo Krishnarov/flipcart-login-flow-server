@@ -23,6 +23,10 @@ const automationJobSchema = new mongoose.Schema({
     type: Date,
     default: null
   },
+  type: {
+    type: String,
+    default: 'EmailLogin'
+  },
   isDeleted: {
     type: Boolean,
     default: false

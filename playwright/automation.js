@@ -6,10 +6,10 @@ import LoginEmail from "../models/LoginEmail.js";
 import { loginToFlipkart, loginToFlipkartWithOTP } from "./flipkart.js";
 import { loginToEmail } from "./kukuEmail.js";
 import { delay } from "./utils.js";
-
-dns.setServers(['1.1.1.1', '8.8.8.8']);
-
-const CONCURRENCY = 3;
+import dotenv from "dotenv";
+dns.setServers(["1.1.1.1", "8.8.8.8"]);
+dotenv.config();
+const CONCURRENCY = process.env.CONCURRENCY || 3;
 
 const BROWSER_ARGS = [
   "--no-sandbox",
@@ -137,9 +137,15 @@ const processEmail = async (record, emailContext, jobId, runHeadless, io) => {
     // Third check — maybe redirected to some other flipkart page (not /account/login)
     if (!loginSuccessful) {
       const currentUrl = flipkartPage.url();
-      if (!currentUrl.includes('/account/login') && currentUrl.includes('flipkart.com')) {
+      if (
+        !currentUrl.includes("/account/login") &&
+        currentUrl.includes("flipkart.com")
+      ) {
         loginSuccessful = true;
-        emitLog(`Redirected away from login page — Login successful! URL: ${currentUrl}`, "success");
+        emitLog(
+          `Redirected away from login page — Login successful! URL: ${currentUrl}`,
+          "success",
+        );
       }
     }
 
@@ -301,7 +307,9 @@ export const runFlipkartAutomation = async (
     "info",
   );
 
-  const emails = await LoginEmail.find({ jobId, status: "pending" }).sort({ email: 1 }).limit(0);
+  const emails = await LoginEmail.find({ jobId, status: "pending" })
+    .sort({ email: 1 })
+    .limit(0);
   emitJobLog(`Found ${emails.length} pending email(s) to process.`, "info");
 
   if (emails.length === 0) {
